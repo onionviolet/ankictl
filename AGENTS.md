@@ -34,6 +34,22 @@ Call `stats --json` first. It returns exact deck names, note types, and their fi
 
 Scope it with a query when the learner is working on one subject: `ankictl.py weak "deck:Chemistry" --json`.
 
+### 2b. Then read the log, not just the counters
+
+`weak` gives you lapse counts. `history --json` gives you the reviews those counts were computed from, and the difference decides what you should do about them.
+
+```
+ankictl.py history "deck:Sec+" --json
+```
+
+Three fields carry most of the signal:
+
+- **`byInterval`** is the important one. A card failing only in the `22-60d` and `60d+` buckets has a consolidation ceiling, and the fix is scheduling (`retention --target`, or a lower `--max-interval`), not a rewrite. A card failing in `1-3d` as well was never encoded, and no scheduler change will save it. Do not rewrite a card whose only failures are at long intervals; you will be rewriting a card that works.
+- **`failedAtIntervals`** per card is the same test at card resolution.
+- **`byHour`** is a claim about the reviewer rather than the material. Treat it as a hypothesis to raise with them, never as grounds to edit cards.
+
+**Respect the `warning` key.** Below a few hundred graded reviews these rates are noise. If `history` emits a warning, say so in your reply instead of reasoning from the percentages; a confident diagnosis off thirty reviews is worse than no diagnosis, because it produces edits to cards that were never the problem.
+
 ### 3. Diagnose across cards, not within one
 
 This is the part a model gets wrong by default. The instinct on seeing eight failing cards is to write eight better explanations. Usually that is the wrong move.
@@ -78,6 +94,20 @@ Other rules that hold up:
 ```
 
 Validation runs before anything is written: unknown deck, unknown note type, and unknown field names all fail with the valid options listed, so a rejected call tells you how to fix it. `canAddNotes` also catches duplicates before the write, which makes the dry run a real check rather than a prediction.
+
+### 6. Know which layer the problem is on
+
+Four layers, and picking the wrong one is the most common way to waste a session.
+
+| The problem is | Fix it with | Not with |
+|---|---|---|
+| the fact is wrong or badly explained | `update` | `add` (a new card orphans the history) |
+| two facts keep swapping | one new discrimination card via `add` | rewriting both originals |
+| the card *asks* the wrong thing (answer visible on the front, hint too generous) | `template` | `update`, which cannot see the template |
+| it survives short intervals and dies at long ones | `retention` / `limits` | rewriting the card |
+| it should not be in rotation at all right now | `suspend` | `reschedule`, and never deletion |
+
+`template` changes every note of that type at once, so verify the dry run. `reschedule` writes a manual entry into the review log and overrides the scheduler's own estimate, which is usually better informed than yours; the honest uses are spreading a backlog (`--days 3-7`, which randomises so the pile does not simply re-form) and resetting a card that was rewritten so heavily its history describes a different card.
 
 ## Safety contract
 

@@ -23,9 +23,13 @@ Reading
   ping                                  confirm Anki + AnkiConnect are up
   decks                                 deck tree with card counts
   weak [query]                          what the learner keeps failing
+  history [query]                       the review log: WHEN and WHERE it fails
   find "<anki search>"                  list matching notes
   audit [query]                         find cards sitting in the wrong deck
   fields --notetype "<name>"            list fields
+  template --notetype "<name>"          card templates and styling
+  tags [query]                          tags in use, with counts
+  retention --deck D                    FSRS / scheduler tuning for a preset
   stats                                 collection shape, for orientation
 
 Writing (DRY RUN unless --apply)
@@ -36,13 +40,18 @@ Writing (DRY RUN unless --apply)
   limits --deck D [--new N --rev N]     daily limits
   preset --deck D [D2...] --clone NAME  give decks their own options preset
   addfield --notetype N --field F       append a field to a note type
+  template --notetype N --set-css F     rewrite a template or its styling
+  tags Q --add T / --remove T           tag maintenance; --rename is collection-wide
+  reschedule Q --days N                 move due dates; --forget resets to new
+  retention --deck D --target 0.9       desired retention on that deck's preset
 
 Every command takes --json for machine-readable output, which is what an agent
 should use. Anki search syntax is the same as the Browse bar: deck:Spanish,
 tag:chem::*, note:Cloze, -deck:Spanish::*, "deck:Spanish -note:Basic".
 
-Port: defaults to 127.0.0.1:8765. Override with the ANKI_CONNECT_URL env var when
-that port is unavailable (see the reserved-range note in the README).
+Port: tries 127.0.0.1:8765, then whatever port the installed AnkiConnect addon is
+actually configured for (read out of its meta.json). ANKI_CONNECT_URL overrides
+both and disables the fallback. See the reserved-range note in the README.
 
 See AGENTS.md for the usage contract an AI should follow.
 """
@@ -50,16 +59,23 @@ See AGENTS.md for the usage contract an AI should follow.
 import argparse
 import json
 import os
+import statistics
 import sys
 import urllib.error
 import urllib.request
+from datetime import datetime
 
-# AnkiConnect's port. Override with ANKI_CONNECT_URL when 8765 is unavailable:
-# on Windows, Hyper-V/WSL/Docker reserve large TCP blocks at boot, and 8765 sits
-# at the top of a commonly-reserved one (8666-8765). A bind into a reserved range
-# fails with WSAEACCES 10013, which AnkiConnect reports as "port in use" even
-# though nothing is listening. See the troubleshooting note in the README.
-URL = os.environ.get("ANKI_CONNECT_URL", "http://127.0.0.1:8765")
+# AnkiConnect's default port. On Windows, Hyper-V/WSL/Docker reserve large TCP
+# blocks at boot and 8765 sits at the top of a commonly-reserved one (8666-8765).
+# A bind into a reserved range fails with WSAEACCES 10013, which AnkiConnect
+# reports as "port in use" even though nothing is listening, so the usual fix is
+# to move the addon to another port. Rather than make every caller remember that,
+# discover_url() reads the port back out of the addon's own config.
+DEFAULT_URL = "http://127.0.0.1:8765"
+URL = os.environ.get("ANKI_CONNECT_URL") or DEFAULT_URL
+PINNED = bool(os.environ.get("ANKI_CONNECT_URL"))  # explicit setting wins, no fallback
+
+ADDON_ID = "2055492159"
 
 TAG_SEPS = ("::", "/")  # Anki's own hierarchy separator, and the common ad-hoc one
 
@@ -68,28 +84,83 @@ class AnkiDown(Exception):
     pass
 
 
-def call(action, **params):
+def addon_data_dirs():
+    """Where Anki keeps addons21, per platform."""
+    home = os.path.expanduser("~")
+    if sys.platform == "win32":
+        base = os.environ.get("APPDATA", os.path.join(home, "AppData", "Roaming"))
+    elif sys.platform == "darwin":
+        base = os.path.join(home, "Library", "Application Support")
+    else:
+        base = os.environ.get("XDG_DATA_HOME", os.path.join(home, ".local", "share"))
+    return [os.path.join(base, "Anki2", "addons21", ADDON_ID)]
+
+
+def configured_port():
+    """The port AnkiConnect is ACTUALLY on, from its own config.
+
+    meta.json holds the live, user-edited config; config.json holds only the
+    shipped defaults, so meta wins. Returns None if the addon is not installed.
+    """
+    for d in addon_data_dirs():
+        for name in ("meta.json", "config.json"):
+            path = os.path.join(d, name)
+            try:
+                with open(path, encoding="utf-8") as fh:
+                    data = json.load(fh)
+            except (OSError, json.JSONDecodeError):
+                continue
+            conf = data.get("config", data)  # meta.json nests it, config.json does not
+            port = conf.get("webBindPort")
+            if port:
+                return int(port)
+    return None
+
+
+def _post(url, action, params):
     payload = json.dumps({"action": action, "version": 6, "params": params}).encode()
-    req = urllib.request.Request(URL, data=payload,
+    req = urllib.request.Request(url, data=payload,
                                  headers={"Content-Type": "application/json"})
+    with urllib.request.urlopen(req, timeout=30) as r:
+        return json.load(r)
+
+
+def call(action, **params):
+    global URL
     try:
-        with urllib.request.urlopen(req, timeout=30) as r:
-            body = json.load(r)
+        body = _post(URL, action, params)
     except urllib.error.URLError as e:
-        raise AnkiDown(
-            f"no AnkiConnect on {URL} ({e.reason}).\n"
-            "  1. Is Anki running?\n"
-            "  2. Addon installed? Tools > Add-ons > Get Add-ons > 2055492159, then restart.\n"
-            "  3. Did AnkiConnect say 'Failed to listen on port'? The port is probably in a\n"
-            "     Windows reserved range, not genuinely in use. Check with:\n"
-            "         netsh interface ipv4 show excludedportrange protocol=tcp\n"
-            "     Pick a port outside every listed range, set it in the addon config\n"
-            "     (Tools > Add-ons > AnkiConnect > Config, \"webBindPort\"), restart Anki,\n"
-            "     then point this tool at it:  set ANKI_CONNECT_URL=http://127.0.0.1:<port>"
-        )
+        found = None if PINNED else configured_port()
+        if found and f":{found}" not in URL:
+            # The addon is installed but listening somewhere else. Retry there
+            # once and pin it for the rest of the run.
+            candidate = f"http://127.0.0.1:{found}"
+            try:
+                body = _post(candidate, action, params)
+            except urllib.error.URLError:
+                raise AnkiDown(down_message(e.reason, also_tried=candidate))
+            URL = candidate
+        else:
+            raise AnkiDown(down_message(e.reason))
     if body.get("error"):
         sys.exit(f"AnkiConnect error on '{action}': {body['error']}")
     return body["result"]
+
+
+def down_message(reason, also_tried=None):
+    extra = f"\n  (also tried {also_tried}, the port its config names)" if also_tried else ""
+    return (
+        f"no AnkiConnect on {URL} ({reason}).{extra}\n"
+        "  1. Is Anki running?\n"
+        "  2. Addon installed? Tools > Add-ons > Get Add-ons > 2055492159, then restart.\n"
+        "  3. Did AnkiConnect say 'Failed to listen on port'? The port is probably in a\n"
+        "     Windows reserved range, not genuinely in use. Check with:\n"
+        "         netsh interface ipv4 show excludedportrange protocol=tcp\n"
+        "     Pick a port outside every listed range, set it in the addon config\n"
+        "     (Tools > Add-ons > AnkiConnect > Config, \"webBindPort\"), restart Anki.\n"
+        "     This tool reads that setting back automatically; ANKI_CONNECT_URL only\n"
+        "     needs setting for a non-local or non-standard host."
+    )
 
 
 def notes_for(query):
@@ -526,6 +597,366 @@ def cmd_addfield(args):
           "you reference it.")
 
 
+# --- review log -------------------------------------------------------------
+
+# revlog.type. 4 is a manual reschedule (setDueDate / forget), which records no
+# recall event at all, so it must be dropped before computing any accuracy.
+REV_LEARN, REV_REVIEW, REV_RELEARN, REV_FILTERED, REV_MANUAL = 0, 1, 2, 3, 4
+GRADED = (REV_LEARN, REV_REVIEW, REV_RELEARN, REV_FILTERED)
+
+# lastIvl is days when positive and SECONDS when negative (Anki stores sub-day
+# learning steps that way). Bucketing on it answers the question a lapse count
+# cannot: not "is this card hard" but "how long does it survive".
+IVL_BUCKETS = [
+    ("learning (<1d)", -10 ** 9, 0),
+    ("1-3d", 1, 3),
+    ("4-7d", 4, 7),
+    ("8-21d", 8, 21),
+    ("22-60d", 22, 60),
+    ("60d+", 61, 10 ** 9),
+]
+
+
+def bucket_of(last_ivl):
+    days = last_ivl if last_ivl >= 0 else 0
+    for name, lo, hi in IVL_BUCKETS:
+        if lo <= days <= hi:
+            return name
+    return "60d+"
+
+
+def rate(again, total):
+    return round(again / total, 3) if total else None
+
+
+def cmd_history(args):
+    """Read the review log itself, not the summary counters.
+
+    'weak' reads lapses and ease off the card, which is a compression of this.
+    The revlog keeps every individual answer: which button, at what interval,
+    at what hour, how long it took. That distinguishes failure modes a lapse
+    count flattens together.
+
+    A card failing only past a three-week interval is a consolidation problem
+    and wants a shorter maximum interval or a rewrite. A card failing at every
+    interval was never encoded and wants a better card. A card that fails only
+    late at night is not a card problem at all. All three look identical as
+    'lapses=4'.
+    """
+    ids = call("findCards", query=f"({args.query}) -is:new")
+    if not ids:
+        sys.exit(f"no reviewed cards match {args.query!r}")
+    logs = call("getReviewsOfCards", cards=ids)
+
+    entries = []  # (cardId, revlog entry)
+    for cid, revs in logs.items():
+        for r in revs:
+            if r["type"] in GRADED and r["ease"] > 0:
+                entries.append((int(cid), r))
+    if not entries:
+        sys.exit(f"{len(ids)} card(s) matched but the log holds no graded reviews "
+                 "(manual reschedules only).")
+
+    by_hour, by_bucket, per_card = {}, {}, {}
+    for cid, r in entries:
+        again = r["ease"] == 1
+        hour = datetime.fromtimestamp(r["id"] / 1000).hour
+        for key, table in ((hour, by_hour), (bucket_of(r["lastIvl"]), by_bucket)):
+            slot = table.setdefault(key, {"reviews": 0, "again": 0})
+            slot["reviews"] += 1
+            slot["again"] += again
+        c = per_card.setdefault(cid, {"reviews": 0, "again": 0, "ms": [],
+                                      "failedAt": []})
+        c["reviews"] += 1
+        c["again"] += again
+        c["ms"].append(r["time"])
+        if again and r["lastIvl"] > 0:
+            c["failedAt"].append(r["lastIvl"])
+
+    stamps = [r["id"] / 1000 for _, r in entries]
+    summary = {
+        "reviews": len(entries),
+        "cards": len(per_card),
+        "againRate": rate(sum(1 for _, r in entries if r["ease"] == 1), len(entries)),
+        "medianSeconds": round(statistics.median(r["time"] for _, r in entries) / 1000, 1),
+        "firstReview": datetime.fromtimestamp(min(stamps)).strftime("%Y-%m-%d"),
+        "lastReview": datetime.fromtimestamp(max(stamps)).strftime("%Y-%m-%d"),
+    }
+
+    worst = [cid for cid, c in per_card.items()
+             if c["reviews"] >= args.min_reps and c["again"]]
+    worst.sort(key=lambda cid: (-per_card[cid]["again"] / per_card[cid]["reviews"],
+                                -per_card[cid]["reviews"]))
+    worst = worst[: args.limit]
+    detail = {c["cardId"]: c for c in call("cardsInfo", cards=worst)} if worst else {}
+
+    cards_out = []
+    for cid in worst:
+        c, d = per_card[cid], detail.get(cid, {})
+        flds = sorted(d.get("fields", {}).items(), key=lambda kv: kv[1]["order"])
+        cards_out.append({
+            "cardId": cid, "deck": d.get("deckName"),
+            "reviews": c["reviews"], "again": c["again"],
+            "againRate": rate(c["again"], c["reviews"]),
+            "medianSeconds": round(statistics.median(c["ms"]) / 1000, 1),
+            # the intervals it survived to and then failed at. A tight cluster
+            # is a consolidation ceiling; scattered values are a bad card.
+            "failedAtIntervals": sorted(c["failedAt"]),
+            "fields": {k: strip_html(v["value"])[:160] for k, v in flds[:2]},
+        })
+
+    out = {
+        "query": args.query,
+        "summary": summary,
+        "byInterval": {name: {**v, "againRate": rate(v["again"], v["reviews"])}
+                       for name, _, _ in IVL_BUCKETS if (v := by_bucket.get(name))},
+        "byHour": {f"{h:02d}": {**v, "againRate": rate(v["again"], v["reviews"])}
+                   for h, v in sorted(by_hour.items())},
+        "cards": cards_out,
+    }
+    if summary["reviews"] < args.min_sample:
+        out["warning"] = (
+            f"only {summary['reviews']} graded reviews. Rates over a sample this "
+            "small are noise; treat the breakdowns as descriptive, not as evidence. "
+            "Come back after a few hundred.")
+    if args.json:
+        return emit(out)
+
+    s = summary
+    print(f"{s['reviews']} graded reviews over {s['cards']} card(s), "
+          f"{s['firstReview']} to {s['lastReview']}")
+    print(f"again rate {s['againRate']:.0%}, median {s['medianSeconds']}s per answer\n")
+    print("by interval the card had reached:")
+    for name, v in out["byInterval"].items():
+        print(f"  {name:<16} {v['reviews']:>5} reviews   again {v['againRate']:.0%}")
+    print("\nby hour of day:")
+    for h, v in out["byHour"].items():
+        print(f"  {h}:00{'':<12} {v['reviews']:>5} reviews   again {v['againRate']:.0%}")
+    if cards_out:
+        print(f"\nworst {len(cards_out)} card(s) with {args.min_reps}+ reviews:")
+        for c in cards_out:
+            failed = (f"  failed at {c['failedAtIntervals']}d"
+                      if c["failedAtIntervals"] else "")
+            print(f"  again {c['againRate']:.0%} of {c['reviews']}   "
+                  f"{c['medianSeconds']}s   [{c['deck']}]{failed}")
+            for k, v in c["fields"].items():
+                print(f"    {k}: {v[:100]}")
+    if "warning" in out:
+        print(f"\nNOTE: {out['warning']}")
+
+
+# --- card templates ---------------------------------------------------------
+
+def cmd_template(args):
+    """Read or rewrite a note type's card templates and styling.
+
+    This is the layer 'add' and 'update' cannot reach. Those change what a card
+    SAYS; this changes what it ASKS. A note whose fields are all correct can
+    still be a bad card because the template shows the answer on the front, or
+    renders a hint that makes recall unnecessary.
+    """
+    templates = call("modelTemplates", modelName=args.notetype)
+    css = call("modelStyling", modelName=args.notetype)["css"]
+
+    writes = {k: v for k, v in (("front", args.set_front), ("back", args.set_back),
+                                ("css", args.set_css)) if v}
+    if not writes:
+        if args.json:
+            return emit({"notetype": args.notetype, "templates": templates, "css": css})
+        for name, sides in templates.items():
+            print(f"--- card template: {name} ---")
+            for side, html in sides.items():
+                print(f"  [{side}]")
+                for line in html.splitlines():
+                    print(f"    {line}")
+        print(f"--- styling ({len(css.splitlines())} lines) ---")
+        for line in css.splitlines():
+            print(f"    {line}")
+        return
+
+    if ("front" in writes or "back" in writes) and not args.card:
+        if len(templates) != 1:
+            sys.exit(f"'{args.notetype}' has {len(templates)} card templates "
+                     f"({', '.join(templates)}); pass --card to say which.")
+        args.card = next(iter(templates))
+    if args.card and args.card not in templates:
+        sys.exit(f"no card template {args.card!r} on '{args.notetype}'. "
+                 f"Have: {', '.join(templates)}")
+
+    read = lambda p: (sys.stdin.read() if p == "-" else open(p, encoding="utf-8").read())
+    new_sides = {}
+    if "front" in writes:
+        new_sides["Front"] = read(writes["front"])
+    if "back" in writes:
+        new_sides["Back"] = read(writes["back"])
+    new_css = read(writes["css"]) if "css" in writes else None
+
+    # A field name mistyped in a template does not error, it renders literally
+    # and silently produces a card that asks nothing. Check before writing.
+    known = set(call("modelFieldNames", modelName=args.notetype))
+    for side, html in new_sides.items():
+        refs = {tok.split("}}")[0].strip().split(":")[-1]
+        for tok in html.split("{{")[1:] if "}}" in tok}
+        unknown = {r for r in refs if r and not r.startswith(("#", "/", "^"))
+                   and r not in known and r not in ("FrontSide", "Tags", "Type",
+                                                    "Deck", "Subdeck", "Card")}
+        if unknown:
+            sys.exit(f"{side} references unknown field(s) {sorted(unknown)}. "
+                     f"Fields on '{args.notetype}': {sorted(known)}")
+
+    print(f"'{args.notetype}'"
+          + (f" card '{args.card}': {', '.join(new_sides)}" if new_sides else "")
+          + (f"{' +' if new_sides else ':'} styling ({len(new_css.splitlines())} lines)"
+             if new_css is not None else ""))
+    if not args.apply:
+        print("DRY RUN. re-run with --apply. This rewrites the template for EVERY "
+              "note of this type; review history is untouched.")
+        return
+    if new_sides:
+        merged = dict(templates[args.card])
+        merged.update(new_sides)
+        call("updateModelTemplates",
+             model={"name": args.notetype, "templates": {args.card: merged}})
+    if new_css is not None:
+        call("updateModelStyling", model={"name": args.notetype, "css": new_css})
+    print("saved.")
+
+
+# --- tags -------------------------------------------------------------------
+
+def cmd_tags(args):
+    """Tags are the retrieval index a tutor navigates by. Keep them clean."""
+    if args.rename:
+        old, new = args.rename
+        print(f"rename tag '{old}' -> '{new}' across the whole collection")
+        if not args.apply:
+            print("DRY RUN. re-run with --apply. This ignores any query you passed.")
+            return
+        call("replaceTagsInAllNotes", tag_to_replace=old, replace_with_tag=new)
+        print("renamed.")
+        return
+
+    notes = notes_for(args.query)
+    if not args.add and not args.remove:
+        counts = {}
+        for n in notes:
+            for t in n["tags"]:
+                counts[t] = counts.get(t, 0) + 1
+        rows = sorted(counts.items(), key=lambda kv: (-kv[1], kv[0]))
+        untagged = sum(1 for n in notes if not n["tags"])
+        if args.json:
+            return emit({"query": args.query, "notes": len(notes),
+                         "untagged": untagged, "tags": dict(rows)})
+        print(f"{len(rows)} tag(s) across {len(notes)} note(s), "
+              f"{untagged} untagged\n")
+        for t, c in rows:
+            print(f"  {c:>5}  {t}")
+        return
+
+    if not notes:
+        sys.exit(f"nothing matches {args.query!r}")
+    ids = [n["noteId"] for n in notes]
+    verb = "add" if args.add else "remove"
+    tags = args.add or args.remove
+    print(f"{verb} {tags} on {len(ids)} note(s) matching {args.query!r}")
+    for n in notes[:10]:
+        print(f"  {first_field(n)[:90]}")
+    if len(notes) > 10:
+        print(f"  ... and {len(notes) - 10} more")
+    if not args.apply:
+        print("\nDRY RUN. re-run with --apply.")
+        return
+    call("addTags" if args.add else "removeTags", notes=ids, tags=" ".join(tags))
+    print(f"\n{verb}d on {len(ids)} note(s).")
+
+
+# --- scheduling -------------------------------------------------------------
+
+def cmd_reschedule(args):
+    """Move due dates, or send cards back to the new queue.
+
+    Use sparingly and prefer 'suspend'. Rescheduling writes a manual entry into
+    the revlog and overrides the scheduler's own estimate, which is usually
+    better informed than a guess. The honest uses are: a backlog that needs
+    spreading, and a card whose explanation was rewritten badly enough that its
+    old history no longer describes the card that now exists.
+    """
+    if not args.forget and not args.days:
+        sys.exit("pass --days N (or --forget). Doing nothing is the safe default here.")
+    ids = call("findCards", query=args.query)
+    if not ids:
+        sys.exit(f"nothing matches {args.query!r}")
+    what = "reset to new (history kept in the log)" if args.forget \
+        else f"due in {args.days} day(s)"
+    print(f"{len(ids)} card(s) matching {args.query!r} -> {what}")
+    if not args.apply:
+        print("DRY RUN. re-run with --apply.")
+        return
+    if args.forget:
+        call("forgetCards", cards=ids)
+    else:
+        # setDueDate takes a string: "3" is exactly 3 days out, "3-7" randomises
+        # in that range (better for a backlog: it avoids rebuilding the pile),
+        # and a trailing '!' keeps the current interval instead of resetting it.
+        call("setDueDate", cards=ids, days=str(args.days))
+    print(f"rescheduled {len(ids)} card(s).")
+
+
+def cmd_retention(args):
+    """Show, and optionally set, the scheduler tuning on a deck's preset.
+
+    Desired retention is the one FSRS knob worth touching: the fraction of cards
+    you want to recall successfully. Raising it shortens every interval, so it
+    buys accuracy with review time, steeply. 0.9 is the default for good reason;
+    0.95 can roughly double daily load for a few points of recall.
+    """
+    conf = call("getDeckConfig", deck=args.deck)
+    weights = conf.get("fsrsParams6") or conf.get("fsrsParams5") or conf.get("fsrsWeights") or []
+    state = {
+        "deck": args.deck, "preset": conf["name"], "presetId": conf["id"],
+        "fsrsParametersPresent": bool(weights),
+        "desiredRetention": conf.get("desiredRetention"),
+        "maximumIntervalDays": conf["rev"]["maxIvl"],
+        "learningStepsMinutes": conf["new"]["delays"],
+        "relearningStepsMinutes": conf["lapse"]["delays"],
+        "leechThreshold": conf["lapse"]["leechFails"],
+        "newPerDay": conf["new"]["perDay"], "reviewsPerDay": conf["rev"]["perDay"],
+    }
+    if args.target is None and args.max_interval is None and args.leech is None:
+        if args.json:
+            return emit(state)
+        for k, v in state.items():
+            print(f"  {k:<24}: {v}")
+        if not weights:
+            print("\nNo FSRS parameters on this preset. Either FSRS is off collection-wide,\n"
+                  "or it is on but has never been optimised. The master toggle and the\n"
+                  "'Optimize' button are GUI-only (Deck Options > FSRS); desired retention\n"
+                  "is settable here but does nothing while FSRS is off.")
+        return
+
+    if conf["id"] == 1 and not args.force:
+        sys.exit("refusing: this deck is on the shared 'Default' preset, so the change\n"
+                 "would hit every deck. Run 'preset --deck ... --clone ...' first, "
+                 "or pass --force.")
+    if args.target is not None:
+        if not 0.7 <= args.target <= 0.99:
+            sys.exit("desired retention must be between 0.70 and 0.99; Anki rejects "
+                     "anything outside that, and above ~0.95 the review cost explodes.")
+        conf["desiredRetention"] = args.target
+        print(f"  desiredRetention -> {args.target}")
+    if args.max_interval is not None:
+        conf["rev"]["maxIvl"] = args.max_interval
+        print(f"  maximumInterval  -> {args.max_interval}d")
+    if args.leech is not None:
+        conf["lapse"]["leechFails"] = args.leech
+        print(f"  leechThreshold   -> {args.leech}")
+    if not args.apply:
+        print("DRY RUN. re-run with --apply.")
+        return
+    call("saveDeckConfig", config=conf)
+    print(f"saved to preset '{conf['name']}'.")
+
+
 def main():
     p = argparse.ArgumentParser(description=__doc__,
                                 formatter_class=argparse.RawDescriptionHelpFormatter)
@@ -579,6 +1010,51 @@ def main():
     af.add_argument("--field", required=True)
     af.add_argument("--apply", action="store_true")
     af.set_defaults(fn=cmd_addfield)
+
+    h = sub.add_parser("history", help="the review log: when and where it fails")
+    h.add_argument("query", nargs="?", default="deck:*")
+    h.add_argument("--min-reps", type=int, default=3,
+                   help="ignore cards with fewer reviews than this (default 3)")
+    h.add_argument("--limit", type=int, default=20)
+    h.add_argument("--min-sample", type=int, default=200,
+                   help="warn that the rates are noise below this many reviews")
+    h.set_defaults(fn=cmd_history)
+
+    tp = sub.add_parser("template", help="card templates and styling")
+    tp.add_argument("--notetype", required=True)
+    tp.add_argument("--card", help="which card template (needed if the type has several)")
+    tp.add_argument("--set-front", metavar="FILE", help="HTML file, or '-' for stdin")
+    tp.add_argument("--set-back", metavar="FILE")
+    tp.add_argument("--set-css", metavar="FILE")
+    tp.add_argument("--apply", action="store_true")
+    tp.set_defaults(fn=cmd_template)
+
+    tg = sub.add_parser("tags", help="tags in use, and tag maintenance")
+    tg.add_argument("query", nargs="?", default="deck:*")
+    tg.add_argument("--add", nargs="+", metavar="TAG")
+    tg.add_argument("--remove", nargs="+", metavar="TAG")
+    tg.add_argument("--rename", nargs=2, metavar=("OLD", "NEW"),
+                    help="collection-wide; ignores the query")
+    tg.add_argument("--apply", action="store_true")
+    tg.set_defaults(fn=cmd_tags)
+
+    rs = sub.add_parser("reschedule", help="move due dates; prefer suspend")
+    rs.add_argument("query")
+    rs.add_argument("--days", help="'3', or '3-7' to spread a backlog randomly")
+    rs.add_argument("--forget", action="store_true", help="send back to the new queue")
+    rs.add_argument("--apply", action="store_true")
+    rs.set_defaults(fn=cmd_reschedule)
+
+    rt = sub.add_parser("retention", help="scheduler tuning on a deck's preset")
+    rt.add_argument("--deck", required=True)
+    rt.add_argument("--target", type=float, metavar="0.9",
+                    help="FSRS desired retention, 0.70-0.99")
+    rt.add_argument("--max-interval", type=int, metavar="DAYS")
+    rt.add_argument("--leech", type=int, metavar="N", help="lapses before leech")
+    rt.add_argument("--apply", action="store_true")
+    rt.add_argument("--force", action="store_true",
+                    help="allow editing the shared Default preset")
+    rt.set_defaults(fn=cmd_retention)
 
     w = sub.add_parser("weak", help="what the learner keeps failing")
     w.add_argument("query", nargs="?", default="deck:*")

@@ -50,10 +50,14 @@ python ankictl.py ping
 | `ping` | confirm Anki and AnkiConnect are reachable |
 | `stats` | decks, note types with their fields, counts. Call this first |
 | `weak [query]` | what the learner keeps failing, worst first |
+| `history [query]` | the review log itself: at what interval and what hour it fails |
 | `decks` | deck tree with new / learning / due counts |
 | `audit [query]` | find cards sitting in the wrong deck |
 | `find "<search>"` | list notes matching an Anki search |
 | `fields --notetype N` | list a note type's fields |
+| `template --notetype N` | card templates and styling |
+| `tags [query]` | tags in use, with counts |
+| `retention --deck D` | scheduler tuning on that deck's preset |
 
 **Writing** (dry run until `--apply`)
 
@@ -66,6 +70,10 @@ python ankictl.py ping
 | `limits --deck D [--new N --rev N]` | show or set daily limits |
 | `preset --deck D [D2 ...] --clone NAME` | give decks their own options preset |
 | `addfield --notetype N --field F` | append a field |
+| `template --notetype N --set-front F` | rewrite a card template or its CSS |
+| `tags "<search>" --add T` | add / remove tags; `--rename` is collection-wide |
+| `reschedule "<search>" --days N` | move due dates; `--forget` resets to new |
+| `retention --deck D --target 0.9` | desired retention, max interval, leech threshold |
 
 Every command takes `--json` for machine-readable output, which is what an agent should use. Searches use the same syntax as Anki's Browse bar: `deck:Spanish`, `tag:chem::*`, `note:Cloze`, `-deck:Spanish::*`.
 
@@ -94,6 +102,18 @@ Pass a query to scope it: `ankictl.py audit "deck:Chemistry"`.
 
 **`preset` takes several decks at once,** because under the v3 scheduler a deck is bound by its own limits *and* by every parent's. Giving a subdeck a roomy preset while its parent keeps the default leaves it throttled by the parent. Pass the whole chain.
 
+## `weak` and `history` read different things
+
+`weak` reads the counters Anki keeps on each card: lapses, ease factor, current interval. Those are a compression, and they flatten failure modes that want opposite fixes.
+
+`history` reads the review log, which keeps every individual answer: which button, at what interval the card had reached, at what hour, how many seconds it took. Three cards can all show `lapses=4` and be three different problems.
+
+- Failing **only past long intervals** is a consolidation ceiling. The card is fine; the interval outran it. Lower the maximum interval or raise desired retention for that deck.
+- Failing **at every interval, including short ones** was never encoded. That is a card problem, and usually an interference problem with a neighbouring card. Rewrite it as a discrimination.
+- Failing **only in one hour band** is not a card problem at all.
+
+The last one is why the hour breakdown is there and why it is worth being suspicious of it: a difference across hours is a claim about the reviewer, not the material, and it needs a real sample before it means anything. `history` prints a warning below 200 graded reviews for that reason. Rates over a few dozen reviews are noise, and a tutor acting on noise will confidently rewrite cards that were never the problem.
+
 ## Notes on daily limits
 
 Two counts in Anki's deck list are limits. One is not.
@@ -114,7 +134,7 @@ Confirm it:
 netsh interface ipv4 show excludedportrange protocol=tcp
 ```
 
-If your port falls inside a listed range, pick one that does not (Anki, Tools, Add-ons, AnkiConnect, Config, `webBindPort`), restart Anki, and point the tool at it:
+If your port falls inside a listed range, pick one that does not (Anki, Tools, Add-ons, AnkiConnect, Config, `webBindPort`) and restart Anki. You do not then have to tell this tool where you moved it: when the default port refuses a connection, it reads `webBindPort` back out of the addon's own `meta.json` and retries there. Set `ANKI_CONNECT_URL` only for a non-local host or a non-standard setup; doing so pins the URL and disables the fallback.
 
 ```
 set ANKI_CONNECT_URL=http://127.0.0.1:8900
