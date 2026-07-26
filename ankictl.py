@@ -17,8 +17,8 @@ Commands
   fields --notetype "<name>"            list fields
   addfield --notetype "<name>" --field "<name>" [--apply]
 
-Anki search syntax is the same as the Browse bar: deck:Mandarin, tag:sec-plus::*,
-note:Cloze, -deck:Mandarin::*, "deck:Mandarin -note:Mandarin*".
+Anki search syntax is the same as the Browse bar: deck:Spanish, tag:chem::*,
+note:Cloze, -deck:Spanish::*, "deck:Spanish -note:Basic".
 
 Port: defaults to 127.0.0.1:8765. Override with the ANKI_CONNECT_URL env var when
 that port is unavailable (see the reserved-range note below and in the README).
@@ -38,14 +38,7 @@ import urllib.request
 # though nothing is listening. See the troubleshooting note in the README.
 URL = os.environ.get("ANKI_CONNECT_URL", "http://127.0.0.1:8765")
 
-# Which notes belong in which deck. Extend as decks are added.
-# (deck-name prefix, predicate on the note's notetype + tags)
-OWNERSHIP = [
-    ("Mandarin", lambda nt, tags: nt.startswith("Mandarin")),
-    ("Sec+", lambda nt, tags: any(t.startswith("sec-plus") for t in tags)),
-    ("EMT", lambda nt, tags: any(t.startswith("emt") for t in tags)),
-    ("CSCI", lambda nt, tags: "csci1100" in tags),
-]
+TAG_SEPS = ("::", "/")  # Anki's own hierarchy separator, and the common ad-hoc one
 
 
 class AnkiDown(Exception):
@@ -95,11 +88,29 @@ def first_field(note):
     return order[0][1]["value"] if order else ""
 
 
-def expected_deck(notetype, tags):
-    for prefix, owns in OWNERSHIP:
-        if owns(notetype, tags):
-            return prefix
-    return None
+def tag_root(tag):
+    """'chem/organic' -> 'chem'.  'bio::ch5' -> 'bio'."""
+    for sep in TAG_SEPS:
+        if sep in tag:
+            return tag.split(sep, 1)[0]
+    return tag
+
+
+def deck_root(deck):
+    """'Chemistry::Organic' -> 'Chemistry'. Misfiles are almost always cross-tree."""
+    return deck.split("::", 1)[0]
+
+
+def signals(note):
+    """The labels that claim a note. A note in the wrong deck disagrees with
+    where the rest of its label-mates live."""
+    out = [("notetype", note["modelName"])]
+    out += [("tag", tag_root(t)) for t in note["tags"]]
+    return out
+
+
+def quote(s):
+    return f'"{s}"' if " " in s or "+" in s else s
 
 
 # --- commands ---------------------------------------------------------------
@@ -118,25 +129,77 @@ def cmd_decks(_):
               f"{d['learn_count']:>6} {d['review_count']:>6}")
 
 
-def cmd_audit(_):
-    bad = []
-    for note in notes_for("deck:*"):
-        want = expected_deck(note["modelName"], note["tags"])
-        if want is None:
+def cmd_audit(args):
+    """Find cards sitting in the wrong deck, with no configuration.
+
+    The insight: a note type or a tag root is a claim about what a note IS, and
+    the deck is a claim about where it LIVES. In a healthy collection those two
+    agree almost perfectly. So learn each label's home deck from the collection
+    itself (whichever deck holds the overwhelming majority of that label's
+    notes), then report the stragglers. Nothing is hardcoded, so this works on
+    any collection, and it adapts as decks are renamed or added.
+    """
+    notes = notes_for(args.query)
+    if not notes:
+        sys.exit(f"no notes match {args.query!r}")
+
+    # label -> deck_root -> count
+    tally = {}
+    for n in notes:
+        for label in signals(n):
+            per_deck = tally.setdefault(label, {})
+            for d in {deck_root(x) for x in n["decks"]}:
+                per_deck[d] = per_deck.get(d, 0) + 1
+
+    home = {}          # label -> (deck_root, share)
+    for label, per_deck in tally.items():
+        total = sum(per_deck.values())
+        if total < args.min_notes:
+            continue   # too little evidence to call anything an outlier
+        top, count = max(per_deck.items(), key=lambda kv: kv[1])
+        share = count / total
+        if share >= args.min_share and count > 1:
+            home[label] = (top, share)
+
+    # Consensus, and it is what makes this usable. Some labels are orthogonal to
+    # subject: a priority tag, 'trap', 'leech', or a shared note type spreads
+    # across every deck, so it looks like it "belongs" to whichever deck is
+    # biggest and would indict every note elsewhere. So a note is only misfiled
+    # when NONE of its labels vouches for the deck it is actually in. One label
+    # dissenting while another agrees is a cross-cutting tag, not a misfile.
+    flagged = {}
+    for n in notes:
+        opinions = [(lbl, *home[lbl]) for lbl in signals(n) if lbl in home]
+        if not opinions:
             continue
-        for deck in note["decks"]:
-            if not deck.startswith(want):
-                bad.append((deck, want, note))
-                break
-    if not bad:
-        print("clean: every note sits under the deck its notetype/tags claim.")
+        here = {deck_root(d) for d in n["decks"]}
+        if any(want in here for _, want, _ in opinions):
+            continue   # something vouches for where it sits
+        label, want, share = max(opinions, key=lambda o: o[2])
+        flagged[n["noteId"]] = (n, sorted(n["decks"])[0], want, share, label)
+
+    if not flagged:
+        print(f"clean: no note sits apart from its label-mates "
+              f"(checked {len(notes)} notes, {len(home)} labels with a clear home).")
         return
-    print(f"{len(bad)} misfiled note(s):\n")
-    for deck, want, note in bad:
-        print(f"  in '{deck}' -> belongs under '{want}'  [{note['modelName']}] "
-              f"tags={' '.join(note['tags'])}\n    {first_field(note)[:110]}")
-    print("\nfix e.g.:  ankictl.py move \"deck:Mandarin tag:sec-plus::*\" "
-          "--to \"Sec+::SY0-701\" --apply")
+
+    print(f"{len(flagged)} misfiled note(s) out of {len(notes)} checked:\n")
+    fixes = {}
+    for n, deck, want, share, (kind, label) in sorted(
+            flagged.values(), key=lambda f: (-f[3], f[1])):
+        print(f"  in '{deck}' -> expected under '{want}'   "
+              f"({kind} '{label}' is {share:.0%} in '{want}')")
+        print(f"    [{n['modelName']}] {first_field(n)[:100]}")
+        sel = (f"{kind}:{label}*" if kind == "tag" else f"note:{label}")
+        fixes.setdefault((deck, want, sel), 0)
+        fixes[(deck, want, sel)] += 1
+
+    print("\nsuggested fixes (dry run without --apply):")
+    for (deck, want, sel), cnt in fixes.items():
+        print(f"  ankictl.py move {quote(f'deck:{deck} -deck:{deck}::* {sel}')} "
+              f"--to {quote(want)}    # {cnt} note(s)")
+    print("\nCheck each search in Anki's Browse bar first. Note that a tag written\n"
+          "'topic/sub' needs 'tag:topic/*', not Anki's '::' hierarchy wildcard.")
 
 
 def cmd_find(args):
@@ -193,17 +256,19 @@ def cmd_limits(args):
 
 
 def cmd_preset(args):
-    current = call("getDeckConfig", deck=args.deck)
-    print(f"'{args.deck}' is on preset '{current['name']}' -> clone as '{args.clone}'")
+    # Under the v3 scheduler a deck is bound by its OWN limits and by every
+    # parent's, so a subdeck given a roomy preset while its parent keeps the
+    # default is still throttled by the parent. Pass the whole chain.
+    current = call("getDeckConfig", deck=args.deck[0])
+    print(f"{args.deck} on preset '{current['name']}' -> clone as '{args.clone}'")
     if not args.apply:
         print("DRY RUN. re-run with --apply.")
         return
-    current["name"] = args.clone
     new_id = call("cloneDeckConfigId", name=args.clone, cloneFrom=current["id"])
     if new_id is False:
         sys.exit("clone failed")
-    call("setDeckConfigId", decks=[args.deck], configId=new_id)
-    print(f"'{args.deck}' now on its own preset '{args.clone}' (id {new_id}).")
+    call("setDeckConfigId", decks=args.deck, configId=new_id)
+    print(f"{len(args.deck)} deck(s) now on preset '{args.clone}' (id {new_id}).")
 
 
 def cmd_fields(args):
@@ -232,7 +297,15 @@ def main():
 
     sub.add_parser("ping").set_defaults(fn=cmd_ping)
     sub.add_parser("decks").set_defaults(fn=cmd_decks)
-    sub.add_parser("audit").set_defaults(fn=cmd_audit)
+    a = sub.add_parser("audit")
+    a.add_argument("query", nargs="?", default="deck:*",
+                   help="limit the audit to a subset (default: whole collection)")
+    a.add_argument("--min-share", type=float, default=0.9,
+                   help="how dominant a label's home deck must be to judge "
+                        "outliers (default 0.9). Lower finds more, and more noise.")
+    a.add_argument("--min-notes", type=int, default=5,
+                   help="ignore labels with fewer notes than this (default 5)")
+    a.set_defaults(fn=cmd_audit)
 
     f = sub.add_parser("find")
     f.add_argument("query")
@@ -255,7 +328,8 @@ def main():
     l.set_defaults(fn=cmd_limits)
 
     pr = sub.add_parser("preset")
-    pr.add_argument("--deck", required=True)
+    pr.add_argument("--deck", required=True, nargs="+",
+                    help="one or more decks; pass the parent chain too")
     pr.add_argument("--clone", required=True)
     pr.add_argument("--apply", action="store_true")
     pr.set_defaults(fn=cmd_preset)
