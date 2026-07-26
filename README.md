@@ -1,19 +1,36 @@
 # ankictl
 
-A single-file, dependency-free CLI for reading and repairing a live [Anki](https://apps.ankiweb.net/) collection from the shell, over the [AnkiConnect](https://ankiweb.net/shared/info/2055492159) addon.
+**Let an AI tutor read and write your [Anki](https://apps.ankiweb.net/) collection.** A single file, no dependencies, over the [AnkiConnect](https://ankiweb.net/shared/info/2055492159) addon.
 
-The headline command is `audit`, which finds cards sitting in the wrong deck. It needs no configuration and knows nothing about your decks in advance.
+Most AI tutoring is amnesiac. The model explains something well, the session ends, and nothing carries. It cannot tell what stuck, so next time it either re-teaches what you already know or skips what you quietly forgot.
+
+Anki has the missing half. Its review log is a per-fact record of what *you specifically* do not know, gathered over months and graded by your actual recall rather than your opinion of your recall. That distinction is the whole reason spaced repetition works.
+
+So: Anki owns **what is known**. The model owns **why it is not sticking, and what to do about it**. This is the bridge.
 
 ```
-$ ankictl.py audit
-11 misfiled note(s) out of 647 checked:
+$ ankictl.py weak --min-lapses 3
+7 struggling card(s), worst first:
 
-  in 'Spanish' -> expected under 'Chemistry'   (tag 'chem' is 97% in 'Chemistry')
-    [Cloze] {{c1::Le Chatelier's principle}} states that a system at equilibrium...
+  lapses=6   ease=180%  ivl=2d  [Chemistry::Organic]
+    Front: What does SN1 stereochemistry produce?
+  lapses=5   ease=185%  ivl=3d  [Chemistry::Organic]
+    Front: What does SN2 stereochemistry produce?
 
-suggested fixes (dry run without --apply):
-  ankictl.py move "deck:Spanish -deck:Spanish::* tag:chem*" --to Chemistry    # 11 note(s)
+Look for what these have in common before explaining them one by one.
+Repeated lapses usually mean two facts are competing, not that one is hard.
 ```
+
+A model reads that, notices the two are not individually hard but are being confused *with each other*, and writes one card that draws the boundary:
+
+```
+$ ankictl.py add --file card.json --apply
+added 1 note(s).
+```
+
+That loop, and the reasoning it depends on, is documented in **[AGENTS.md](AGENTS.md)**.
+
+It also does plain collection maintenance, including `audit`, which finds cards sitting in the wrong deck with no configuration at all.
 
 ## Install
 
@@ -26,21 +43,33 @@ python ankictl.py ping
 
 ## Commands
 
+**Reading**
+
 | Command | Does |
 |---|---|
 | `ping` | confirm Anki and AnkiConnect are reachable |
+| `stats` | decks, note types with their fields, counts. Call this first |
+| `weak [query]` | what the learner keeps failing, worst first |
 | `decks` | deck tree with new / learning / due counts |
 | `audit [query]` | find cards sitting in the wrong deck |
 | `find "<search>"` | list notes matching an Anki search |
-| `move "<search>" --to "<deck>"` | change deck, preserving scheduling |
-| `limits --deck D [--new N --rev N]` | show or set daily limits |
-| `preset --deck D [D2 ...] --clone "<name>"` | give decks their own options preset |
 | `fields --notetype N` | list a note type's fields |
+
+**Writing** (dry run until `--apply`)
+
+| Command | Does |
+|---|---|
+| `add --file notes.json` | create notes; `-` reads stdin |
+| `update --file edits.json` | rewrite fields, keeping review history |
+| `move "<search>" --to "<deck>"` | change deck, preserving scheduling |
+| `suspend` / `unsuspend "<search>"` | take cards out of / back into rotation |
+| `limits --deck D [--new N --rev N]` | show or set daily limits |
+| `preset --deck D [D2 ...] --clone NAME` | give decks their own options preset |
 | `addfield --notetype N --field F` | append a field |
 
-Searches use the same syntax as Anki's Browse bar: `deck:Spanish`, `tag:chem::*`, `note:Cloze`, `-deck:Spanish::*`.
+Every command takes `--json` for machine-readable output, which is what an agent should use. Searches use the same syntax as Anki's Browse bar: `deck:Spanish`, `tag:chem::*`, `note:Cloze`, `-deck:Spanish::*`.
 
-**Every mutating command is a dry run until you pass `--apply`.**
+**There is no delete command, deliberately.** Suspension is reversible; deletion throws away review history that took months to accumulate. An agent should not be able to do that in one call. Deleting stays a human action in the GUI, where it can be undone.
 
 ## How `audit` works without configuration
 
@@ -97,11 +126,23 @@ The reservations are reshuffled on reboot, so a port that works today can break 
 netsh int ipv4 set dynamic tcp start=49152 num=16384
 ```
 
+## On model choice
+
+This tool hands a model destructive verbs and a search language that fails quietly. That makes capability load-bearing rather than a nice-to-have, for three specific reasons:
+
+- **Anki search has traps that return zero results instead of an error.** A tag written `topic/sub` needs `tag:topic/*`; the `::` hierarchy wildcard matches nothing against it. `deck:X` includes subdecks unless excluded. A model that writes a plausible query and does not check the count will move the wrong cards, or none, and report success either way.
+- **Diagnosis is not retrieval.** Noticing that six failing cards share one confusable boundary, rather than being six independently hard facts, means holding them together and reasoning about interference. Weaker models reliably default to re-explaining each card in turn, which looks like tutoring and does not teach.
+- **Fabrication is unusually expensive here.** A wrong fact in a chat reply is read once. A wrong fact written into a card is rehearsed on a spaced schedule, on purpose, for months. Spaced repetition installs errors exactly as well as it installs facts.
+
+Use a frontier model, pass `--json`, and read the dry run.
+
 ## Why it exists
 
-A batch of Cloze cards imported into the wrong deck and sat there for weeks, quietly inflating an unrelated review queue. The cause was a missing `#deck:` line in the import file's header block: Anki falls back to whatever deck happens to be selected. A missing `#notetype:` throws a visible error, a missing `#deck:` fails silently.
+A batch of Cloze cards imported into the wrong deck and sat there for weeks, quietly inflating an unrelated review queue. The cause was a missing `#deck:` line in an import header: Anki falls back to whatever deck happens to be selected. A missing `#notetype:` throws a visible error, a missing `#deck:` fails silently.
 
-Finding that by clicking through the Browse window is tedious and depends on noticing. `audit` makes it mechanical.
+Finding that by clicking through Browse is tedious and depends on noticing. `audit` makes it mechanical. The rest of the tool followed from a better question: if a model can already see the collection, why is it not teaching from it?
+
+Designed and written by [Claude Opus 5](https://www.anthropic.com/claude) with its author, against that real collection. Two of the design decisions here came from things going wrong mid-build rather than from planning, and both are documented in [AGENTS.md](AGENTS.md#provenance).
 
 ## License
 
