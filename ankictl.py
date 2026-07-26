@@ -1,27 +1,50 @@
 #!/usr/bin/env python3
-"""ankictl - talk to a running Anki over AnkiConnect (127.0.0.1:8765).
+"""ankictl - let an AI tutor read and write your Anki collection.
+
+A single-file, dependency-free bridge between a language model and a running
+Anki, over the AnkiConnect addon. Anki is a near-perfect substrate for a tutor:
+it already knows, per fact, whether you know it. This exposes that record so a
+model can teach against evidence instead of guesswork, and write what it teaches
+back as cards.
+
+The teaching loop it is built for:
+
+    weak     ->  what is the learner actually failing, and how badly
+    (model reasons about WHY those specific items are confusable)
+    add      ->  write targeted cards, usually discriminations, not definitions
+    update   ->  rewrite a card whose back explains the fact badly
+    audit    ->  keep the collection structurally sound as it grows
 
 Stdlib only. Requires the AnkiConnect addon (code 2055492159) installed and
 Anki running. Nothing here touches collection.anki2 directly: writing to the
 file while Anki holds it open risks corruption and gets overwritten anyway.
 
-Commands
+Reading
   ping                                  confirm Anki + AnkiConnect are up
   decks                                 deck tree with card counts
-  audit                                 find cards sitting in the wrong deck
+  weak [query]                          what the learner keeps failing
   find "<anki search>"                  list matching notes
-  move "<anki search>" --to "<deck>"    change deck (DRY RUN unless --apply)
-  limits --deck "<deck>"                show the deck's daily limits
-  limits --deck "<deck>" --new N --rev N [--apply]   set them
-  preset --deck "<deck>" --clone "<name>" [--apply]  give a deck its own preset
+  audit [query]                         find cards sitting in the wrong deck
   fields --notetype "<name>"            list fields
-  addfield --notetype "<name>" --field "<name>" [--apply]
+  stats                                 collection shape, for orientation
 
-Anki search syntax is the same as the Browse bar: deck:Spanish, tag:chem::*,
-note:Cloze, -deck:Spanish::*, "deck:Spanish -note:Basic".
+Writing (DRY RUN unless --apply)
+  add --file notes.json                 create notes; '-' reads stdin
+  update --file edits.json              rewrite fields of existing notes
+  move "<anki search>" --to "<deck>"    change deck, scheduling preserved
+  suspend / unsuspend "<anki search>"   take cards out of / back into rotation
+  limits --deck D [--new N --rev N]     daily limits
+  preset --deck D [D2...] --clone NAME  give decks their own options preset
+  addfield --notetype N --field F       append a field to a note type
+
+Every command takes --json for machine-readable output, which is what an agent
+should use. Anki search syntax is the same as the Browse bar: deck:Spanish,
+tag:chem::*, note:Cloze, -deck:Spanish::*, "deck:Spanish -note:Basic".
 
 Port: defaults to 127.0.0.1:8765. Override with the ANKI_CONNECT_URL env var when
-that port is unavailable (see the reserved-range note below and in the README).
+that port is unavailable (see the reserved-range note in the README).
+
+See AGENTS.md for the usage contract an AI should follow.
 """
 
 import argparse
@@ -113,16 +136,213 @@ def quote(s):
     return f'"{s}"' if " " in s or "+" in s else s
 
 
+def emit(payload):
+    """Machine-readable output. Agents should always pass --json: parsing the
+    human tables is exactly the kind of brittle step that invents facts."""
+    print(json.dumps(payload, ensure_ascii=False, indent=2))
+
+
+def strip_html(s):
+    out, depth = [], 0
+    for ch in s:
+        if ch == "<":
+            depth += 1
+        elif ch == ">":
+            depth = max(0, depth - 1)
+        elif depth == 0:
+            out.append(ch)
+    return (" ".join("".join(out).split())
+            .replace("&nbsp;", " ").replace("&amp;", "&")
+            .replace("&lt;", "<").replace("&gt;", ">"))
+
+
+def load_json_arg(path):
+    raw = sys.stdin.read() if path == "-" else open(path, encoding="utf-8").read()
+    try:
+        data = json.loads(raw)
+    except json.JSONDecodeError as e:
+        sys.exit(f"input is not valid JSON: {e}")
+    return data if isinstance(data, list) else [data]
+
+
 # --- commands ---------------------------------------------------------------
+
+def cmd_weak(args):
+    """The teaching signal.
+
+    Anki's review log already contains a per-fact record of what this learner
+    does not know: lapses (times a mature card was forgotten), ease factor (how
+    hard the scheduler has concluded a card is), and the leech tag. That is a
+    far better basis for a tutor than asking someone what they find difficult,
+    because self-assessment is exactly what spaced repetition exists to correct.
+
+    Cards are ranked by lapses first, then by ease. A model should read the
+    OUTPUT of this, look for what the failing items have in common, and teach
+    that, rather than re-explaining each card in isolation.
+    """
+    ids = call("findCards", query=f"({args.query}) -is:new")
+    if not ids:
+        sys.exit(f"no reviewed cards match {args.query!r}")
+    info = call("cardsInfo", cards=ids)
+    rows = []
+    for c in info:
+        if c["lapses"] < args.min_lapses:
+            continue
+        flds = sorted(c["fields"].items(), key=lambda kv: kv[1]["order"])
+        rows.append({
+            "cardId": c["cardId"], "noteId": c["note"], "deck": c["deckName"],
+            "notetype": c["modelName"], "lapses": c["lapses"], "reps": c["reps"],
+            # factor is per-mille (2500 == 250% ease). Below ~2000 means the
+            # scheduler has repeatedly been told this card is hard.
+            "ease": round(c["factor"] / 10) if c["factor"] else None,
+            "intervalDays": c["interval"],
+            "fields": {k: strip_html(v["value"]) for k, v in flds},
+        })
+    rows.sort(key=lambda r: (-r["lapses"], r["ease"] or 9999))
+    rows = rows[: args.limit]
+    if args.json:
+        return emit({"query": args.query, "count": len(rows), "cards": rows})
+    if not rows:
+        print(f"nothing with {args.min_lapses}+ lapses in {args.query!r}. "
+              "Either it is genuinely solid or it has not been reviewed enough yet.")
+        return
+    print(f"{len(rows)} struggling card(s), worst first:\n")
+    for r in rows:
+        ease = f"{r['ease']}%" if r["ease"] else "n/a"
+        print(f"  lapses={r['lapses']:<3} ease={ease:<6} ivl={r['intervalDays']}d  "
+              f"[{r['deck']}]")
+        for k, v in list(r["fields"].items())[:2]:
+            print(f"    {k}: {v[:100]}")
+    print("\nLook for what these have in common before explaining them one by one.\n"
+          "Repeated lapses usually mean two facts are competing, not that one is hard.")
+
+
+def cmd_add(args):
+    """Create notes from JSON. This is how a tutor writes what it taught.
+
+    [{"deck": "...", "notetype": "Basic",
+      "fields": {"Front": "...", "Back": "..."}, "tags": ["..."]}]
+    """
+    items = load_json_arg(args.file)
+    decks, models = set(call("deckNames")), set(call("modelNames"))
+    notes = []
+    for i, it in enumerate(items):
+        for key in ("deck", "notetype", "fields"):
+            if key not in it:
+                sys.exit(f"item {i}: missing required key {key!r}")
+        if it["deck"] not in decks:
+            sys.exit(f"item {i}: deck {it['deck']!r} does not exist. Existing: "
+                     f"{sorted(decks)}")
+        if it["notetype"] not in models:
+            sys.exit(f"item {i}: notetype {it['notetype']!r} does not exist. "
+                     f"Existing: {sorted(models)}")
+        valid = call("modelFieldNames", modelName=it["notetype"])
+        unknown = set(it["fields"]) - set(valid)
+        if unknown:
+            sys.exit(f"item {i}: notetype {it['notetype']!r} has no field(s) "
+                     f"{sorted(unknown)}. Fields are: {valid}")
+        notes.append({"deckName": it["deck"], "modelName": it["notetype"],
+                      "fields": it["fields"], "tags": it.get("tags", []),
+                      "options": {"allowDuplicate": False}})
+    # canAddNotes catches duplicates and empty first fields BEFORE writing, so a
+    # dry run is a real check rather than a guess about what would happen.
+    ok = call("canAddNotes", notes=notes)
+    blocked = [i for i, good in enumerate(ok) if not good]
+    if not args.apply:
+        if args.json:
+            return emit({"dryRun": True, "wouldAdd": sum(ok), "blocked": blocked,
+                         "reason": "duplicate first field or empty first field"})
+        print(f"{sum(ok)} of {len(notes)} note(s) can be added"
+              + (f"; {len(blocked)} blocked (duplicate or empty first field): "
+                 f"{blocked}" if blocked else ""))
+        print("DRY RUN. re-run with --apply.")
+        return
+    if blocked and not args.json:
+        print(f"{len(blocked)} note(s) blocked as duplicate/empty: {blocked}")
+    ids = call("addNotes", notes=notes)
+    added = [i for i in ids if i]
+    if args.json:
+        return emit({"added": len(added), "noteIds": ids})
+    print(f"added {len(added)} note(s).")
+
+
+def cmd_update(args):
+    """Rewrite fields on existing notes: [{"noteId": 123, "fields": {...}}]
+
+    Preferred over delete-and-recreate, which throws away the card's review
+    history. A card whose explanation was bad should keep its lapse record.
+    """
+    items = load_json_arg(args.file)
+    for i, it in enumerate(items):
+        if "noteId" not in it or "fields" not in it:
+            sys.exit(f"item {i}: needs 'noteId' and 'fields'")
+    if not args.apply:
+        if args.json:
+            return emit({"dryRun": True, "wouldUpdate": len(items)})
+        for it in items:
+            print(f"  note {it['noteId']}: {list(it['fields'])}")
+        print(f"\nDRY RUN. {len(items)} note(s). re-run with --apply. "
+              "Review history is preserved.")
+        return
+    for it in items:
+        call("updateNoteFields",
+             note={"id": it["noteId"], "fields": it["fields"]})
+    (emit({"updated": len(items)}) if args.json
+     else print(f"updated {len(items)} note(s)."))
+
+
+def cmd_suspend(args):
+    ids = call("findCards", query=args.query)
+    if not ids:
+        sys.exit(f"nothing matches {args.query!r}")
+    verb = "suspend" if args.cmd == "suspend" else "unsuspend"
+    if not args.apply:
+        if args.json:
+            return emit({"dryRun": True, "action": verb, "cards": len(ids)})
+        print(f"would {verb} {len(ids)} card(s). DRY RUN, re-run with --apply.")
+        return
+    call(verb, cards=ids)
+    (emit({"action": verb, "cards": len(ids)}) if args.json
+     else print(f"{verb}ed {len(ids)} card(s)."))
+
+
+def cmd_stats(args):
+    """Orientation. An agent should call this first: it is cheaper than
+    guessing deck and note type names and then failing on a write."""
+    decks = call("deckNames")
+    models = call("modelNames")
+    out = {
+        "decks": decks,
+        "notetypes": {m: call("modelFieldNames", modelName=m) for m in models},
+        "counts": {
+            "notes": len(call("findNotes", query="deck:*")),
+            "new": len(call("findCards", query="is:new")),
+            "due": len(call("findCards", query="is:due")),
+            "suspended": len(call("findCards", query="is:suspended")),
+            "leeches": len(call("findCards", query="tag:leech")),
+        },
+    }
+    if args.json:
+        return emit(out)
+    print(f"decks ({len(decks)}): {', '.join(decks)}\n")
+    print("notetypes:")
+    for m, f in out["notetypes"].items():
+        print(f"  {m}: {f}")
+    print("\ncounts:", ", ".join(f"{k}={v}" for k, v in out["counts"].items()))
+
 
 def cmd_ping(_):
     print(f"AnkiConnect v{call('version')}")
     print(f"decks: {len(call('deckNames'))}  notes: {len(call('findNotes', query='deck:*'))}")
 
 
-def cmd_decks(_):
+def cmd_decks(args):
     stats = call("getDeckStats", decks=call("deckNames"))
     rows = sorted(stats.values(), key=lambda d: d["name"])
+    if args.json:
+        return emit({"decks": [
+            {"name": d["name"], "total": d["total_in_deck"], "new": d["new_count"],
+             "learn": d["learn_count"], "due": d["review_count"]} for d in rows]})
     print(f"{'deck':<32} {'total':>7} {'new':>6} {'learn':>6} {'due':>6}")
     for d in rows:
         print(f"{d['name']:<32} {d['total_in_deck']:>7} {d['new_count']:>6} "
@@ -178,6 +398,14 @@ def cmd_audit(args):
         label, want, share = max(opinions, key=lambda o: o[2])
         flagged[n["noteId"]] = (n, sorted(n["decks"])[0], want, share, label)
 
+    if args.json:
+        return emit({"checked": len(notes), "labelsWithHome": len(home),
+                     "misfiled": [
+                         {"noteId": n["noteId"], "in": deck, "expected": want,
+                          "because": {"label": f"{lk}:{lv}", "share": round(share, 3)},
+                          "notetype": n["modelName"],
+                          "preview": strip_html(first_field(n))[:120]}
+                         for n, deck, want, share, (lk, lv) in flagged.values()]})
     if not flagged:
         print(f"clean: no note sits apart from its label-mates "
               f"(checked {len(notes)} notes, {len(home)} labels with a clear home).")
@@ -204,6 +432,14 @@ def cmd_audit(args):
 
 def cmd_find(args):
     notes = notes_for(args.query)
+    if args.json:
+        return emit({"query": args.query, "count": len(notes), "notes": [
+            {"noteId": n["noteId"], "notetype": n["modelName"],
+             "decks": n["decks"], "tags": n["tags"],
+             "fields": {k: strip_html(v["value"])
+                        for k, v in sorted(n["fields"].items(),
+                                           key=lambda kv: kv[1]["order"])}}
+            for n in notes[: args.limit]]})
     print(f"{len(notes)} note(s) matching {args.query!r}\n")
     for n in notes[: args.limit]:
         print(f"  [{n['modelName']}] {'/'.join(n['decks'])}  tags={' '.join(n['tags'])}")
@@ -343,6 +579,34 @@ def main():
     af.add_argument("--field", required=True)
     af.add_argument("--apply", action="store_true")
     af.set_defaults(fn=cmd_addfield)
+
+    w = sub.add_parser("weak", help="what the learner keeps failing")
+    w.add_argument("query", nargs="?", default="deck:*")
+    w.add_argument("--min-lapses", type=int, default=1)
+    w.add_argument("--limit", type=int, default=30)
+    w.set_defaults(fn=cmd_weak)
+
+    ad = sub.add_parser("add", help="create notes from JSON")
+    ad.add_argument("--file", required=True, help="JSON file, or '-' for stdin")
+    ad.add_argument("--apply", action="store_true")
+    ad.set_defaults(fn=cmd_add)
+
+    up = sub.add_parser("update", help="rewrite fields on existing notes")
+    up.add_argument("--file", required=True, help="JSON file, or '-' for stdin")
+    up.add_argument("--apply", action="store_true")
+    up.set_defaults(fn=cmd_update)
+
+    for name in ("suspend", "unsuspend"):
+        s = sub.add_parser(name)
+        s.add_argument("query")
+        s.add_argument("--apply", action="store_true")
+        s.set_defaults(fn=cmd_suspend)
+
+    sub.add_parser("stats", help="decks, notetypes, counts").set_defaults(fn=cmd_stats)
+
+    for sp in sub.choices.values():
+        sp.add_argument("--json", action="store_true",
+                        help="machine-readable output; agents should use this")
 
     args = p.parse_args()
     try:
