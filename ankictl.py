@@ -328,12 +328,25 @@ def cmd_add(args):
                  f"{blocked}" if blocked else ""))
         print("DRY RUN. re-run with --apply.")
         return
-    if blocked and not args.json:
-        print(f"{len(blocked)} note(s) blocked as duplicate/empty: {blocked}")
-    ids = call("addNotes", notes=notes)
+    # Send ONLY what canAddNotes accepted. addNotes fails the WHOLE batch if any
+    # single note is a duplicate (it returns a top-level error, not per-note
+    # nulls), so passing the rejects through means one already-imported card
+    # blocks every new one. That makes re-running a capture file, which is the
+    # normal way to catch up on what was missed, silently add nothing.
+    addable = [n for n, good in zip(notes, ok) if good]
+    if not addable:
+        msg = f"nothing to add: all {len(notes)} note(s) are already in the collection."
+        return emit({"added": 0, "alreadyPresent": len(blocked)}) if args.json \
+            else print(msg)
+    if not args.json:
+        if blocked:
+            print(f"{len(blocked)} note(s) already present, skipping those.")
+        print(f"adding {len(addable)} new note(s)...")
+    ids = call("addNotes", notes=addable)
     added = [i for i in ids if i]
     if args.json:
-        return emit({"added": len(added), "noteIds": ids})
+        return emit({"added": len(added), "noteIds": added,
+                     "alreadyPresent": len(blocked)})
     print(f"added {len(added)} note(s).")
 
 
