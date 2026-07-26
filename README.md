@@ -58,6 +58,7 @@ python ankictl.py ping
 | `template --notetype N` | card templates and styling |
 | `tags [query]` | tags in use, with counts |
 | `retention --deck D` | scheduler tuning on that deck's preset |
+| `audio --deck D` | autoplay / replay behaviour on that deck's preset |
 
 **Writing** (dry run until `--apply`)
 
@@ -74,6 +75,7 @@ python ankictl.py ping
 | `tags "<search>" --add T` | add / remove tags; `--rename` is collection-wide |
 | `reschedule "<search>" --days N` | move due dates; `--forget` resets to new |
 | `retention --deck D --target 0.9` | desired retention, max interval, leech threshold |
+| `audio --deck D --autoplay off` | turn every `{{tts}}` and `[sound:]` into a play button |
 
 Every command takes `--json` for machine-readable output, which is what an agent should use. Searches use the same syntax as Anki's Browse bar: `deck:Spanish`, `tag:chem::*`, `note:Cloze`, `-deck:Spanish::*`.
 

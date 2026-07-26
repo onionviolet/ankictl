@@ -106,6 +106,9 @@ Four layers, and picking the wrong one is the most common way to waste a session
 | the card *asks* the wrong thing (answer visible on the front, hint too generous) | `template` | `update`, which cannot see the template |
 | it survives short intervals and dies at long ones | `retention` / `limits` | rewriting the card |
 | it should not be in rotation at all right now | `suspend` | `reschedule`, and never deletion |
+| the card gives away its own answer | `template` + `audio --autoplay off` | rewriting the fields |
+
+That last row is the one people get wrong. A hint printed on the front and a hint played on the front are the same leak, but **automatic delivery is what leaks, not the presence of the material**. `{{hint:Field}}` and a `{{tts}}` tag under `autoplay: off` both put the answer on the front and neither gives it away, because the learner has to reach for it. Reaching for a hint after a failed attempt is worth more than never seeing one.
 
 `template` changes every note of that type at once, so verify the dry run. `reschedule` writes a manual entry into the review log and overrides the scheduler's own estimate, which is usually better informed than yours; the honest uses are spreading a backlog (`--days 3-7`, which randomises so the pile does not simply re-form) and resetting a card that was rewritten so heavily its history describes a different card.
 

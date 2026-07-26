@@ -970,6 +970,49 @@ def cmd_retention(args):
     print(f"saved to preset '{conf['name']}'.")
 
 
+def cmd_audio(args):
+    """Autoplay and replay behaviour for a deck's preset.
+
+    Turning autoplay OFF is what converts a `{{tts}}` tag from something that
+    fires at you into a play button you press. That distinction matters on a
+    recognition card: audio that plays by itself on the front hands over the
+    pronunciation before any retrieval is attempted, which is the same leak as
+    printing the reading on the front. Audio you choose to play is a hint.
+
+    These are per-PRESET, not per-deck, and not per-card, so they apply to
+    every deck sharing the preset.
+    """
+    conf = call("getDeckConfig", deck=args.deck)
+    flags = {"autoplay": "play audio automatically",
+             "replayq": "replay the question's audio when showing the answer"}
+    if args.autoplay is None and args.replay_question is None:
+        state = {"deck": args.deck, "preset": conf["name"],
+                 **{k: conf.get(k) for k in flags}}
+        if args.json:
+            return emit(state)
+        print(f"deck '{args.deck}' uses preset '{conf['name']}'")
+        for k, why in flags.items():
+            print(f"  {k:<10}: {conf.get(k)}   ({why})")
+        return
+
+    if conf["id"] == 1 and not args.force:
+        sys.exit("refusing: this deck is on the shared 'Default' preset, so the change\n"
+                 "would hit every deck. Run 'preset --deck ... --clone ...' first, "
+                 "or pass --force.")
+    on = lambda v: v == "on"
+    if args.autoplay is not None:
+        conf["autoplay"] = on(args.autoplay)
+        print(f"  autoplay -> {conf['autoplay']}")
+    if args.replay_question is not None:
+        conf["replayq"] = on(args.replay_question)
+        print(f"  replayq  -> {conf['replayq']}")
+    if not args.apply:
+        print("DRY RUN. re-run with --apply.")
+        return
+    call("saveDeckConfig", config=conf)
+    print(f"saved to preset '{conf['name']}'.")
+
+
 def main():
     p = argparse.ArgumentParser(description=__doc__,
                                 formatter_class=argparse.RawDescriptionHelpFormatter)
@@ -1057,6 +1100,16 @@ def main():
     rs.add_argument("--forget", action="store_true", help="send back to the new queue")
     rs.add_argument("--apply", action="store_true")
     rs.set_defaults(fn=cmd_reschedule)
+
+    au = sub.add_parser("audio", help="autoplay / replay behaviour on a deck's preset")
+    au.add_argument("--deck", required=True)
+    au.add_argument("--autoplay", choices=("on", "off"),
+                    help="off turns every {{tts}} and [sound:] into a play button")
+    au.add_argument("--replay-question", choices=("on", "off"))
+    au.add_argument("--apply", action="store_true")
+    au.add_argument("--force", action="store_true",
+                    help="allow editing the shared Default preset")
+    au.set_defaults(fn=cmd_audio)
 
     rt = sub.add_parser("retention", help="scheduler tuning on a deck's preset")
     rt.add_argument("--deck", required=True)
