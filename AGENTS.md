@@ -71,8 +71,10 @@ over two separate cards defining IPS and IDS.
 Other rules that hold up:
 
 - **One retrieval per card.** The front asks one thing. The back may be rich.
-- **Do not card what was never missed.** A card for a fact already known costs review time forever and buys nothing. `weak` is the input for a reason.
-- **Do not bulk-generate.** Ten targeted cards beat two hundred generated from a syllabus, and two hundred cards nobody chose will be abandoned inside a week.
+- **Comprehensive coverage is allowed inside a deliberate card-worthy scope.** A stable, useful, atomic fact may earn a card before it is missed. The scope must come from an authoritative objective, chapter foundation, or explicit learner choice, not from copying every sentence in a source.
+- **Misses and slow recalls get emphasis, not exclusive admission.** Use `weak` and `history` to find what needs better examples, discrimination cards, rewrites, or tighter scheduling.
+- **Authorship is not activation.** Source-bounded batches may be written ahead, but introduce them by current unit and review capacity. Suspend or queue later material rather than flooding the new-card backlog.
+- **Do not confuse comprehensive with indiscriminate generation.** Dry-run source-driven batches, inspect representative cards, and reject paragraph summaries, duplicates, and facts with no durable retrieval value.
 - **Prefer `update` to delete-and-recreate.** A card whose explanation was bad should keep its review history; that history is the evidence of what was hard.
 
 ### 5. Write it
