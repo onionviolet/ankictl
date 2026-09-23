@@ -48,6 +48,7 @@ python ankictl.py ping
 | Command | Does |
 |---|---|
 | `ping` | confirm Anki and AnkiConnect are reachable |
+| `repair` | list exact card IDs and reasons captured by the `onionviolet/anki` review menu |
 | `stats` | decks, note types with their fields, counts. Call this first |
 | `weak [query]` | what the learner keeps failing, worst first |
 | `history [query]` | the review log itself: at what interval and what hour it fails |

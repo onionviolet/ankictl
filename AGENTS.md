@@ -20,6 +20,9 @@ ankictl.py add --file new-cards.json        # dry run first
 ankictl.py add --file new-cards.json --apply
 ```
 
+When using the `onionviolet/anki` fork, run `ankictl.py repair --json` to read
+review-time explanation and confusion markers before deciding what to fix.
+
 ### 1. Orient before writing
 
 Call `stats --json` first. It returns exact deck names, note types, and their field names. Writing a card to a guessed deck name fails; writing to a real one that is wrong for the content is worse, because it succeeds silently. Never invent a deck or field name, and never create a deck as a side effect of adding cards.

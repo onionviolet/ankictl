@@ -59,6 +59,7 @@ See AGENTS.md for the usage contract an AI should follow.
 import argparse
 import json
 import os
+import re
 import statistics
 import sys
 import urllib.error
@@ -528,6 +529,36 @@ def cmd_find(args):
     for n in notes[: args.limit]:
         print(f"  [{n['modelName']}] {'/'.join(n['decks'])}  tags={' '.join(n['tags'])}")
         print(f"    {first_field(n)[:130]}")
+
+
+REPAIR_TAG = re.compile(r"^weibao::repair::([a-z_]+)::card_(\d+)$", re.IGNORECASE)
+
+
+def repair_markers(notes):
+    """Resolve syncable reviewer tags to exact cards and repair reasons."""
+    rows = []
+    for note in notes:
+        for tag in note["tags"]:
+            match = REPAIR_TAG.fullmatch(tag)
+            if match:
+                rows.append({
+                    "noteId": note["noteId"],
+                    "cardId": int(match.group(2)),
+                    "reason": match.group(1).lower(),
+                    "decks": note["decks"],
+                    "preview": strip_html(first_field(note))[:130],
+                })
+    return rows
+
+
+def cmd_repair(args):
+    rows = repair_markers(notes_for("tag:weibao::repair::*"))
+    if args.json:
+        return emit({"count": len(rows), "markers": rows[:args.limit]})
+    print(f"{len(rows)} repair marker(s)\n")
+    for row in rows[:args.limit]:
+        print(f"  card {row['cardId']} [{'/'.join(row['decks'])}] "
+              f"{row['reason']}: {row['preview']}")
 
 
 def cmd_move(args):
@@ -1034,6 +1065,10 @@ def main():
     f.add_argument("query")
     f.add_argument("--limit", type=int, default=40)
     f.set_defaults(fn=cmd_find)
+
+    repair = sub.add_parser("repair", help="cards marked for repair in the fork")
+    repair.add_argument("--limit", type=int, default=40)
+    repair.set_defaults(fn=cmd_repair)
 
     m = sub.add_parser("move")
     m.add_argument("query")
