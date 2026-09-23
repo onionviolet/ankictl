@@ -2,7 +2,7 @@
 """ankictl - let an AI tutor read and write your Anki collection.
 
 A single-file, dependency-free bridge between a language model and a running
-Anki, over the AnkiConnect addon. Anki is a near-perfect substrate for a tutor:
+Anki, over the AnkiConnect API. Anki is a near-perfect substrate for a tutor:
 it already knows, per fact, whether you know it. This exposes that record so a
 model can teach against evidence instead of guesswork, and write what it teaches
 back as cards.
@@ -15,8 +15,8 @@ The teaching loop it is built for:
     update   ->  rewrite a card whose back explains the fact badly
     audit    ->  keep the collection structurally sound as it grows
 
-Stdlib only. Requires the AnkiConnect addon (code 2055492159) installed and
-Anki running. Nothing here touches collection.anki2 directly: writing to the
+Stdlib only. Requires AnkiConnect, either bundled in the Weibao Anki fork or
+installed as add-on 2055492159, and Anki running. Nothing here touches collection.anki2 directly: writing to the
 file while Anki holds it open risks corruption and gets overwritten anyway.
 
 Reading
@@ -153,7 +153,7 @@ def down_message(reason, also_tried=None):
     return (
         f"no AnkiConnect on {URL} ({reason}).{extra}\n"
         "  1. Is Anki running?\n"
-        "  2. Addon installed? Tools > Add-ons > Get Add-ons > 2055492159, then restart.\n"
+        "  2. Using the Anki fork? Open a profile. Otherwise install add-on 2055492159 and restart.\n"
         "  3. Did AnkiConnect say 'Failed to listen on port'? The port is probably in a\n"
         "     Windows reserved range, not genuinely in use. Check with:\n"
         "         netsh interface ipv4 show excludedportrange protocol=tcp\n"
